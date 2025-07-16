@@ -5,9 +5,13 @@
 (define-constant err-not-found (err u103))
 (define-constant err-wrong-status (err u104))
 (define-constant err-insufficient-funds (err u105))
+(define-constant err-insufficient-approvals (err u106))
+(define-constant err-already-approved (err u107))
+(define-constant err-not-approver (err u108))
 
 (define-data-var escrow-fee uint u2)
 (define-data-var minimum-deposit uint u1000)
+(define-data-var approval-threshold uint u2)
 
 (define-map Properties
     { property-id: uint }
@@ -29,12 +33,27 @@
     { amount: uint }
 )
 
+(define-map PropertyApprovers
+    { property-id: uint }
+    { approvers: (list 10 principal) }
+)
+
+(define-map ApprovalStatus
+    {
+        property-id: uint,
+        approver: principal,
+        milestone: (string-ascii 20),
+    }
+    { approved: bool }
+)
+
 (define-public (create-escrow
         (property-id uint)
         (buyer principal)
         (price uint)
         (deposit uint)
         (deadline uint)
+        (approvers (list 10 principal))
     )
     (let ((current-height burn-block-height))
         (asserts! (>= deposit (var-get minimum-deposit)) err-insufficient-funds)
@@ -51,6 +70,7 @@
             mortgage-approved: false,
             deadline: deadline,
         })
+        (map-set PropertyApprovers { property-id: property-id } { approvers: approvers })
         (ok true)
     )
 )
@@ -64,6 +84,7 @@
             (or
                 (is-eq tx-sender (get buyer property))
                 (is-eq tx-sender contract-owner)
+                (has-sufficient-approvals property-id "inspection")
             )
             err-not-authorized
         )
@@ -83,6 +104,7 @@
             (or
                 (is-eq tx-sender (get seller property))
                 (is-eq tx-sender contract-owner)
+                (has-sufficient-approvals property-id "title")
             )
             err-not-authorized
         )
@@ -102,6 +124,7 @@
             (or
                 (is-eq tx-sender (get buyer property))
                 (is-eq tx-sender contract-owner)
+                (has-sufficient-approvals property-id "mortgage")
             )
             err-not-authorized
         )
@@ -186,4 +209,106 @@
 
 (define-read-only (get-minimum-deposit)
     (ok (var-get minimum-deposit))
+)
+
+(define-public (submit-approval
+        (property-id uint)
+        (milestone (string-ascii 20))
+    )
+    (let ((approvers-data (unwrap! (map-get? PropertyApprovers { property-id: property-id })
+            err-not-found
+        )))
+        (asserts! (is-some (index-of (get approvers approvers-data) tx-sender))
+            err-not-approver
+        )
+        (asserts!
+            (is-none (map-get? ApprovalStatus {
+                property-id: property-id,
+                approver: tx-sender,
+                milestone: milestone,
+            }))
+            err-already-approved
+        )
+        (map-set ApprovalStatus {
+            property-id: property-id,
+            approver: tx-sender,
+            milestone: milestone,
+        } { approved: true }
+        )
+        (ok true)
+    )
+)
+
+(define-private (count-approvals
+        (property-id uint)
+        (milestone (string-ascii 20))
+    )
+    (let ((approvers-data (default-to { approvers: (list) }
+            (map-get? PropertyApprovers { property-id: property-id })
+        )))
+        (fold count-approval-fold (get approvers approvers-data) {
+            property-id: property-id,
+            milestone: milestone,
+            count: u0,
+        })
+    )
+)
+
+(define-private (count-approval-fold
+        (approver principal)
+        (acc {
+            property-id: uint,
+            milestone: (string-ascii 20),
+            count: uint,
+        })
+    )
+    (let ((approval-status (map-get? ApprovalStatus {
+            property-id: (get property-id acc),
+            approver: approver,
+            milestone: (get milestone acc),
+        })))
+        (if (and (is-some approval-status) (get approved (unwrap-panic approval-status)))
+            (merge acc { count: (+ (get count acc) u1) })
+            acc
+        )
+    )
+)
+
+(define-private (has-sufficient-approvals
+        (property-id uint)
+        (milestone (string-ascii 20))
+    )
+    (let ((approval-count (get count (count-approvals property-id milestone))))
+        (>= approval-count (var-get approval-threshold))
+    )
+)
+
+(define-public (update-approval-threshold (new-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set approval-threshold new-threshold)
+        (ok true)
+    )
+)
+
+(define-read-only (get-approval-threshold)
+    (ok (var-get approval-threshold))
+)
+
+(define-read-only (get-property-approvers (property-id uint))
+    (ok (unwrap! (map-get? PropertyApprovers { property-id: property-id })
+        err-not-found
+    ))
+)
+
+(define-read-only (get-approval-status
+        (property-id uint)
+        (approver principal)
+        (milestone (string-ascii 20))
+    )
+    (ok (map-get? ApprovalStatus {
+        property-id: property-id,
+        approver: approver,
+        milestone: milestone,
+    }))
 )
