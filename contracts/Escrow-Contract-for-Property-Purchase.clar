@@ -47,6 +47,28 @@
     { approved: bool }
 )
 
+(define-data-var transaction-counter uint u0)
+
+(define-map PropertyHistory
+    {
+        property-id: uint,
+        transaction-id: uint,
+    }
+    {
+        from-owner: (optional principal),
+        to-owner: principal,
+        price: uint,
+        transaction-type: (string-ascii 20),
+        block-height: uint,
+        timestamp: uint,
+    }
+)
+
+(define-map PropertyTransactionCount
+    { property-id: uint }
+    { count: uint }
+)
+
 (define-public (create-escrow
         (property-id uint)
         (buyer principal)
@@ -71,6 +93,9 @@
             deadline: deadline,
         })
         (map-set PropertyApprovers { property-id: property-id } { approvers: approvers })
+        (unwrap-panic (record-property-transaction property-id none tx-sender deposit
+            "escrow-created"
+        ))
         (ok true)
     )
 )
@@ -154,6 +179,9 @@
         (map-set Properties { property-id: property-id }
             (merge property { status: "completed" })
         )
+        (unwrap-panic (record-property-transaction property-id (some (get seller property))
+            (get buyer property) (get price property) "purchase-completed"
+        ))
         (ok true)
     )
 )
@@ -179,6 +207,9 @@
         (map-set Properties { property-id: property-id }
             (merge property { status: "cancelled" })
         )
+        (unwrap-panic (record-property-transaction property-id (some (get seller property))
+            (get buyer property) (get deposit property) "escrow-cancelled"
+        ))
         (ok true)
     )
 )
@@ -311,4 +342,68 @@
         approver: approver,
         milestone: milestone,
     }))
+)
+
+(define-private (record-property-transaction
+        (property-id uint)
+        (from-owner (optional principal))
+        (to-owner principal)
+        (price uint)
+        (transaction-type (string-ascii 20))
+    )
+    (let (
+            (current-count (default-to u0
+                (get count
+                    (map-get? PropertyTransactionCount { property-id: property-id })
+                )))
+            (new-transaction-id (+ (var-get transaction-counter) u1))
+        )
+        (map-set PropertyHistory {
+            property-id: property-id,
+            transaction-id: new-transaction-id,
+        } {
+            from-owner: from-owner,
+            to-owner: to-owner,
+            price: price,
+            transaction-type: transaction-type,
+            block-height: burn-block-height,
+            timestamp: burn-block-height,
+        })
+        (map-set PropertyTransactionCount { property-id: property-id } { count: (+ current-count u1) })
+        (var-set transaction-counter new-transaction-id)
+        (ok true)
+    )
+)
+
+(define-read-only (get-property-history (property-id uint))
+    (let ((transaction-count (default-to u0
+            (get count
+                (map-get? PropertyTransactionCount { property-id: property-id })
+            ))))
+        (ok (map get-transaction-by-id (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)))
+    )
+)
+
+(define-private (get-transaction-by-id (transaction-id uint))
+    (map-get? PropertyHistory {
+        property-id: u0,
+        transaction-id: transaction-id,
+    })
+)
+
+(define-read-only (get-property-transaction
+        (property-id uint)
+        (transaction-id uint)
+    )
+    (ok (map-get? PropertyHistory {
+        property-id: property-id,
+        transaction-id: transaction-id,
+    }))
+)
+
+(define-read-only (get-property-transaction-count (property-id uint))
+    (ok (default-to u0
+        (get count
+            (map-get? PropertyTransactionCount { property-id: property-id })
+        )))
 )
