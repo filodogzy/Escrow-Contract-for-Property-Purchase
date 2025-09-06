@@ -8,6 +8,11 @@
 (define-constant err-insufficient-approvals (err u106))
 (define-constant err-already-approved (err u107))
 (define-constant err-not-approver (err u108))
+(define-constant err-dispute-not-found (err u109))
+(define-constant err-dispute-already-exists (err u110))
+(define-constant err-not-arbitrator (err u111))
+(define-constant err-already-voted (err u112))
+(define-constant err-dispute-not-active (err u113))
 
 (define-data-var escrow-fee uint u2)
 (define-data-var minimum-deposit uint u1000)
@@ -48,6 +53,8 @@
 )
 
 (define-data-var transaction-counter uint u0)
+(define-data-var dispute-counter uint u0)
+(define-data-var arbitrator-threshold uint u3)
 
 (define-map PropertyHistory
     {
@@ -67,6 +74,29 @@
 (define-map PropertyTransactionCount
     { property-id: uint }
     { count: uint }
+)
+
+(define-map PropertyDisputes
+    { dispute-id: uint }
+    {
+        property-id: uint,
+        milestone: (string-ascii 20),
+        raised-by: principal,
+        status: (string-ascii 20),
+        resolution: (string-ascii 50),
+        arbitrators: (list 10 principal),
+        votes-for: uint,
+        votes-against: uint,
+        created-at: uint,
+    }
+)
+
+(define-map ArbitratorVotes
+    {
+        dispute-id: uint,
+        arbitrator: principal,
+    }
+    { vote: bool }
 )
 
 (define-public (create-escrow
@@ -164,7 +194,7 @@
             (property (unwrap! (map-get? Properties { property-id: property-id })
                 err-not-found
             ))
-            (current-height stacks-block-height)
+            (current-height burn-block-height)
             (fee-amount (/ (* (get price property) (var-get escrow-fee)) u100))
         )
         (asserts! (is-eq (get buyer property) tx-sender) err-not-authorized)
@@ -191,7 +221,7 @@
             (property (unwrap! (map-get? Properties { property-id: property-id })
                 err-not-found
             ))
-            (current-height stacks-block-height)
+            (current-height burn-block-height)
         )
         (asserts!
             (or
@@ -380,13 +410,22 @@
             (get count
                 (map-get? PropertyTransactionCount { property-id: property-id })
             ))))
-        (ok (map get-transaction-by-id (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)))
+        (ok (list
+            (get-transaction-by-id property-id u1)
+            (get-transaction-by-id property-id u2)
+            (get-transaction-by-id property-id u3)
+            (get-transaction-by-id property-id u4)
+            (get-transaction-by-id property-id u5)
+        ))
     )
 )
 
-(define-private (get-transaction-by-id (transaction-id uint))
+(define-private (get-transaction-by-id
+        (property-id uint)
+        (transaction-id uint)
+    )
     (map-get? PropertyHistory {
-        property-id: u0,
+        property-id: property-id,
         transaction-id: transaction-id,
     })
 )
@@ -406,4 +445,223 @@
         (get count
             (map-get? PropertyTransactionCount { property-id: property-id })
         )))
+)
+
+(define-public (raise-dispute
+        (property-id uint)
+        (milestone (string-ascii 20))
+        (arbitrators (list 10 principal))
+    )
+    (let (
+            (property (unwrap! (map-get? Properties { property-id: property-id })
+                err-not-found
+            ))
+            (new-dispute-id (+ (var-get dispute-counter) u1))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender (get buyer property))
+                (is-eq tx-sender (get seller property))
+            )
+            err-not-authorized
+        )
+        (asserts! (is-none (get-active-dispute property-id milestone))
+            err-dispute-already-exists
+        )
+        (map-set PropertyDisputes { dispute-id: new-dispute-id } {
+            property-id: property-id,
+            milestone: milestone,
+            raised-by: tx-sender,
+            status: "active",
+            resolution: "",
+            arbitrators: arbitrators,
+            votes-for: u0,
+            votes-against: u0,
+            created-at: burn-block-height,
+        })
+        (var-set dispute-counter new-dispute-id)
+        (ok new-dispute-id)
+    )
+)
+
+(define-public (arbitrator-vote
+        (dispute-id uint)
+        (vote bool)
+    )
+    (let (
+            (dispute (unwrap! (map-get? PropertyDisputes { dispute-id: dispute-id })
+                err-dispute-not-found
+            ))
+            (arbitrators (get arbitrators dispute))
+        )
+        (asserts! (is-some (index-of arbitrators tx-sender)) err-not-arbitrator)
+        (asserts! (is-eq (get status dispute) "active") err-dispute-not-active)
+        (asserts!
+            (is-none (map-get? ArbitratorVotes {
+                dispute-id: dispute-id,
+                arbitrator: tx-sender,
+            }))
+            err-already-voted
+        )
+        (map-set ArbitratorVotes {
+            dispute-id: dispute-id,
+            arbitrator: tx-sender,
+        } { vote: vote }
+        )
+        (let (
+                (new-votes-for (if vote
+                    (+ (get votes-for dispute) u1)
+                    (get votes-for dispute)
+                ))
+                (new-votes-against (if vote
+                    (get votes-against dispute)
+                    (+ (get votes-against dispute) u1)
+                ))
+                (total-votes (+ new-votes-for new-votes-against))
+            )
+            (map-set PropertyDisputes { dispute-id: dispute-id }
+                (merge dispute {
+                    votes-for: new-votes-for,
+                    votes-against: new-votes-against,
+                })
+            )
+            (if (>= total-votes (var-get arbitrator-threshold))
+                (resolve-dispute dispute-id)
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-private (resolve-dispute (dispute-id uint))
+    (let (
+            (dispute (unwrap! (map-get? PropertyDisputes { dispute-id: dispute-id })
+                err-dispute-not-found
+            ))
+            (votes-for (get votes-for dispute))
+            (votes-against (get votes-against dispute))
+            (property-id (get property-id dispute))
+            (milestone (get milestone dispute))
+        )
+        (if (> votes-for votes-against)
+            (begin
+                (map-set PropertyDisputes { dispute-id: dispute-id }
+                    (merge dispute {
+                        status: "resolved",
+                        resolution: "milestone-approved",
+                    })
+                )
+                (try! (force-milestone-approval property-id milestone))
+            )
+            (begin
+                (map-set PropertyDisputes { dispute-id: dispute-id }
+                    (merge dispute {
+                        status: "resolved",
+                        resolution: "milestone-rejected",
+                    })
+                )
+                (try! (force-milestone-rejection property-id milestone))
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-private (force-milestone-approval
+        (property-id uint)
+        (milestone (string-ascii 20))
+    )
+    (let ((property (unwrap! (map-get? Properties { property-id: property-id }) err-not-found)))
+        (if (is-eq milestone "inspection")
+            (map-set Properties { property-id: property-id }
+                (merge property { inspection-passed: true })
+            )
+            (if (is-eq milestone "title")
+                (map-set Properties { property-id: property-id }
+                    (merge property { title-cleared: true })
+                )
+                (if (is-eq milestone "mortgage")
+                    (map-set Properties { property-id: property-id }
+                        (merge property { mortgage-approved: true })
+                    )
+                    false
+                )
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-private (force-milestone-rejection
+        (property-id uint)
+        (milestone (string-ascii 20))
+    )
+    (let ((property (unwrap! (map-get? Properties { property-id: property-id }) err-not-found)))
+        (if (is-eq milestone "inspection")
+            (map-set Properties { property-id: property-id }
+                (merge property { inspection-passed: false })
+            )
+            (if (is-eq milestone "title")
+                (map-set Properties { property-id: property-id }
+                    (merge property { title-cleared: false })
+                )
+                (if (is-eq milestone "mortgage")
+                    (map-set Properties { property-id: property-id }
+                        (merge property { mortgage-approved: false })
+                    )
+                    false
+                )
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-private (get-active-dispute
+        (property-id uint)
+        (milestone (string-ascii 20))
+    )
+    (fold check-active-dispute (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) none)
+)
+
+(define-private (check-active-dispute
+        (dispute-id uint)
+        (acc (optional uint))
+    )
+    (if (is-some acc)
+        acc
+        (match (map-get? PropertyDisputes { dispute-id: dispute-id })
+            dispute (if (is-eq (get status dispute) "active")
+                (some dispute-id)
+                none
+            )
+            none
+        )
+    )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (ok (map-get? PropertyDisputes { dispute-id: dispute-id }))
+)
+
+(define-read-only (get-arbitrator-vote
+        (dispute-id uint)
+        (arbitrator principal)
+    )
+    (ok (map-get? ArbitratorVotes {
+        dispute-id: dispute-id,
+        arbitrator: arbitrator,
+    }))
+)
+
+(define-public (update-arbitrator-threshold (new-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set arbitrator-threshold new-threshold)
+        (ok true)
+    )
+)
+
+(define-read-only (get-arbitrator-threshold)
+    (ok (var-get arbitrator-threshold))
 )
