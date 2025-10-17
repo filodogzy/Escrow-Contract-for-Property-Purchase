@@ -13,6 +13,10 @@
 (define-constant err-not-arbitrator (err u111))
 (define-constant err-already-voted (err u112))
 (define-constant err-dispute-not-active (err u113))
+(define-constant err-milestone-not-completed (err u114))
+(define-constant err-payment-already-made (err u115))
+(define-constant err-invalid-payment-amount (err u116))
+(define-constant err-payment-schedule-not-found (err u117))
 
 (define-data-var escrow-fee uint u2)
 (define-data-var minimum-deposit uint u1000)
@@ -97,6 +101,21 @@
         arbitrator: principal,
     }
     { vote: bool }
+)
+
+(define-map PaymentSchedules
+    { property-id: uint }
+    {
+        inspection-amount: uint,
+        title-amount: uint,
+        mortgage-amount: uint,
+        final-amount: uint,
+        inspection-paid: bool,
+        title-paid: bool,
+        mortgage-paid: bool,
+        final-paid: bool,
+        total-paid: uint,
+    }
 )
 
 (define-public (create-escrow
@@ -664,4 +683,170 @@
 
 (define-read-only (get-arbitrator-threshold)
     (ok (var-get arbitrator-threshold))
+)
+
+(define-public (setup-payment-schedule
+        (property-id uint)
+        (inspection-amount uint)
+        (title-amount uint)
+        (mortgage-amount uint)
+        (final-amount uint)
+    )
+    (let ((property (unwrap! (map-get? Properties { property-id: property-id }) err-not-found)))
+        (asserts! (is-eq tx-sender (get seller property)) err-not-authorized)
+        (asserts!
+            (is-eq
+                (+ (+ (+ inspection-amount title-amount) mortgage-amount)
+                    final-amount
+                )
+                (get price property)
+            )
+            err-invalid-payment-amount
+        )
+        (map-set PaymentSchedules { property-id: property-id } {
+            inspection-amount: inspection-amount,
+            title-amount: title-amount,
+            mortgage-amount: mortgage-amount,
+            final-amount: final-amount,
+            inspection-paid: false,
+            title-paid: false,
+            mortgage-paid: false,
+            final-paid: false,
+            total-paid: u0,
+        })
+        (ok true)
+    )
+)
+
+(define-public (pay-milestone
+        (property-id uint)
+        (milestone (string-ascii 20))
+    )
+    (let (
+            (property (unwrap! (map-get? Properties { property-id: property-id })
+                err-not-found
+            ))
+            (schedule (unwrap! (map-get? PaymentSchedules { property-id: property-id })
+                err-payment-schedule-not-found
+            ))
+        )
+        (asserts! (is-eq tx-sender (get buyer property)) err-not-authorized)
+        (if (is-eq milestone "inspection")
+            (begin
+                (asserts! (get inspection-passed property)
+                    err-milestone-not-completed
+                )
+                (asserts! (not (get inspection-paid schedule))
+                    err-payment-already-made
+                )
+                (try! (stx-transfer? (get inspection-amount schedule) tx-sender
+                    (get seller property)
+                ))
+                (map-set PaymentSchedules { property-id: property-id }
+                    (merge schedule {
+                        inspection-paid: true,
+                        total-paid: (+ (get total-paid schedule)
+                            (get inspection-amount schedule)
+                        ),
+                    })
+                )
+                (ok true)
+            )
+            (if (is-eq milestone "title")
+                (begin
+                    (asserts! (get title-cleared property)
+                        err-milestone-not-completed
+                    )
+                    (asserts! (not (get title-paid schedule))
+                        err-payment-already-made
+                    )
+                    (try! (stx-transfer? (get title-amount schedule) tx-sender
+                        (get seller property)
+                    ))
+                    (map-set PaymentSchedules { property-id: property-id }
+                        (merge schedule {
+                            title-paid: true,
+                            total-paid: (+ (get total-paid schedule)
+                                (get title-amount schedule)
+                            ),
+                        })
+                    )
+                    (ok true)
+                )
+                (if (is-eq milestone "mortgage")
+                    (begin
+                        (asserts! (get mortgage-approved property)
+                            err-milestone-not-completed
+                        )
+                        (asserts! (not (get mortgage-paid schedule))
+                            err-payment-already-made
+                        )
+                        (try! (stx-transfer? (get mortgage-amount schedule) tx-sender
+                            (get seller property)
+                        ))
+                        (map-set PaymentSchedules { property-id: property-id }
+                            (merge schedule {
+                                mortgage-paid: true,
+                                total-paid: (+ (get total-paid schedule)
+                                    (get mortgage-amount schedule)
+                                ),
+                            })
+                        )
+                        (ok true)
+                    )
+                    (if (is-eq milestone "final")
+                        (begin
+                            (asserts! (get inspection-paid schedule)
+                                err-milestone-not-completed
+                            )
+                            (asserts! (get title-paid schedule)
+                                err-milestone-not-completed
+                            )
+                            (asserts! (get mortgage-paid schedule)
+                                err-milestone-not-completed
+                            )
+                            (asserts! (not (get final-paid schedule))
+                                err-payment-already-made
+                            )
+                            (try! (stx-transfer? (get final-amount schedule) tx-sender
+                                (get seller property)
+                            ))
+                            (map-set PaymentSchedules { property-id: property-id }
+                                (merge schedule {
+                                    final-paid: true,
+                                    total-paid: (+ (get total-paid schedule)
+                                        (get final-amount schedule)
+                                    ),
+                                })
+                            )
+                            (map-set Properties { property-id: property-id }
+                                (merge property { status: "completed" })
+                            )
+                            (ok true)
+                        )
+                        err-not-found
+                    )
+                )
+            )
+        )
+    )
+)
+
+(define-read-only (get-payment-schedule (property-id uint))
+    (ok (map-get? PaymentSchedules { property-id: property-id }))
+)
+
+(define-read-only (get-payment-progress (property-id uint))
+    (let ((schedule (map-get? PaymentSchedules { property-id: property-id })))
+        (ok (if (is-some schedule)
+            (some {
+                total-paid: (get total-paid (unwrap-panic schedule)),
+                inspection-status: (get inspection-paid (unwrap-panic schedule)),
+                title-status: (get title-paid (unwrap-panic schedule)),
+                mortgage-status: (get mortgage-paid (unwrap-panic schedule)),
+                final-status: (get final-paid (unwrap-panic schedule)),
+            })
+            none
+        ))
+    )
 )
