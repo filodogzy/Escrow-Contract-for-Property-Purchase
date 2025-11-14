@@ -118,6 +118,16 @@
     }
 )
 
+(define-map EscrowTemplates
+    { template-id: uint }
+    {
+        seller: principal,
+        default-price: uint,
+        default-deposit: uint,
+        default-deadline-offset: uint,
+        approvers: (list 10 principal),
+    }
+)
 (define-public (create-escrow
         (property-id uint)
         (buyer principal)
@@ -848,5 +858,75 @@
             })
             none
         ))
+    )
+)
+
+(define-public (create-escrow-template
+        (template-id uint)
+        (default-price uint)
+        (default-deposit uint)
+        (default-deadline-offset uint)
+        (approvers (list 10 principal))
+    )
+    (begin
+        (asserts!
+            (is-none (map-get? EscrowTemplates { template-id: template-id }))
+            err-already-initialized
+        )
+        (asserts! (> default-deadline-offset u0) err-wrong-status)
+        (asserts! (>= default-deposit (var-get minimum-deposit))
+            err-insufficient-funds
+        )
+        (map-set EscrowTemplates { template-id: template-id } {
+            seller: tx-sender,
+            default-price: default-price,
+            default-deposit: default-deposit,
+            default-deadline-offset: default-deadline-offset,
+            approvers: approvers,
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (get-escrow-template (template-id uint))
+    (ok (unwrap! (map-get? EscrowTemplates { template-id: template-id })
+        err-not-found
+    ))
+)
+
+(define-public (create-escrow-from-template
+        (property-id uint)
+        (buyer principal)
+        (template-id uint)
+    )
+    (let (
+            (current-height burn-block-height)
+            (template (unwrap! (map-get? EscrowTemplates { template-id: template-id })
+                err-not-found
+            ))
+            (deadline (+ current-height (get default-deadline-offset template)))
+            (deposit (get default-deposit template))
+            (price (get default-price template))
+        )
+        (asserts! (is-eq tx-sender (get seller template)) err-not-authorized)
+        (asserts! (> deadline current-height) err-wrong-status)
+        (asserts! (>= deposit (var-get minimum-deposit)) err-insufficient-funds)
+        (try! (stx-transfer? deposit tx-sender (as-contract tx-sender)))
+        (map-set Properties { property-id: property-id } {
+            seller: tx-sender,
+            buyer: buyer,
+            price: price,
+            deposit: deposit,
+            status: "pending",
+            inspection-passed: false,
+            title-cleared: false,
+            mortgage-approved: false,
+            deadline: deadline,
+        })
+        (map-set PropertyApprovers { property-id: property-id } { approvers: (get approvers template) })
+        (unwrap-panic (record-property-transaction property-id none tx-sender deposit
+            "escrow-created"
+        ))
+        (ok true)
     )
 )
